@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <zlib.h>
+#include <stdint.h>
 
 #define BUFFER_SIZE 1024
 
@@ -109,11 +111,63 @@ int main(int argc, char *argv[])
 
 		pthread_create(&tid, NULL, http_handler, args);
 		pthread_detach(tid);
-		printf("Client connected\n");
+		printf("\nClient connected\n");
 	}
 
 	close(server_sock);
 
+	return 0;
+}
+
+unsigned char *zlibCompress(const unsigned char *src, size_t src_len, size_t *out_len)
+{
+	if (src == NULL || src_len == 0 || out_len == NULL)
+	{
+		return NULL;
+	}
+
+	uLong dest_len = compressBound((uLong)src_len) * 2;
+	unsigned char *dest = (unsigned char *)malloc(dest_len);
+	if (dest == NULL)
+	{
+		return NULL;
+	}
+
+	z_stream zs;
+	zs.zalloc = Z_NULL;
+	zs.zfree = Z_NULL;
+	zs.opaque = Z_NULL;
+	zs.avail_in = (uInt)src_len;
+	zs.next_in = (Bytef *)src;
+	zs.avail_out = (uInt)(dest_len);
+	zs.next_out = (Bytef *)dest;
+	deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 | 16, 8,
+				 Z_DEFAULT_STRATEGY);
+	deflate(&zs, Z_FINISH);
+	deflateEnd(&zs);
+	*out_len = zs.total_out;
+
+	return dest;
+}
+
+static int send_all(int client_sock, const void *buffer, size_t length)
+{
+	const unsigned char *data = buffer;
+	while (length > 0)
+	{
+		ssize_t sent = send(client_sock, data, length, 0);
+		if (sent < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (sent == 0)
+			return -1;
+
+		data += sent;
+		length -= (size_t)sent;
+	}
 	return 0;
 }
 
@@ -145,13 +199,71 @@ void *http_handler(void *args)
 
 	if (strncmp(path, "/echo/", 6) == 0)
 	{
+		char *accept_encoding = strstr(request_buf, "Accept-Encoding: ");
 		char *content = path + 6;
-		format = "HTTP/1.1 200 OK\r\n"
-				 "Content-Type: text/plain\r\n"
-				 "Content-Length: %zu\r\n\r\n%s";
+		int supportsCompression = 0;
+		size_t content_len = strlen(content);
 
-		sprintf(response, format, strlen(content), content);
-		printf("response data : \n%s", response);
+		if (accept_encoding)
+		{
+			accept_encoding += strlen("Accept-Encoding: ");
+
+			// Remove \r\n
+			char *end = strstr(accept_encoding, "\r\n");
+			if (end)
+				*end = '\0';
+
+			// Comma Seperated List
+			char *token = strtok(accept_encoding, ",");
+			while (token != NULL)
+			{
+				if (strncmp(token, "gzip", 4) == 0)
+				{
+					supportsCompression = 1;
+					break;
+				}
+				accept_encoding += strlen(token) + 2;
+				token = strtok(NULL, ", ");
+			}
+		}
+
+		if (supportsCompression)
+		{
+			size_t compressed_len = 0;
+			unsigned char *compressed_data = zlibCompress((const unsigned char *)content, content_len, &compressed_len);
+			if (compressed_data == NULL)
+			{
+				snprintf(response, sizeof(response), "HTTP/1.1 500 Internal Server Error\r\n\r\n");
+			}
+			else
+			{
+				int header_len = snprintf(response, sizeof(response),
+								  "HTTP/1.1 200 OK\r\n"
+								  "Content-Type: text/plain\r\n"
+								  "Content-Encoding: gzip\r\n"
+								  "Content-Length: %zu\r\n\r\n",
+								  compressed_len);
+				if (header_len < 0 || (size_t)header_len >= sizeof(response) ||
+					send_all(client_sock, response, (size_t)header_len) != 0 ||
+					send_all(client_sock, compressed_data, compressed_len) != 0)
+				{
+					free(compressed_data);
+					close(client_sock);
+					return NULL;
+				}
+				free(compressed_data);
+				close(client_sock);
+				return NULL;
+			}
+		}
+		else
+		{
+			format = "HTTP/1.1 200 OK\r\n"
+					 "Content-Type: text/plain\r\n"
+					 "Content-Length: %zu\r\n\r\n%s";
+			sprintf(response, format, content_len, content);
+		}
+		printf("\nresponse data : \n%s", response);
 	}
 	else if (strncmp(path, "/user-agent", 11) == 0)
 	{
@@ -170,7 +282,7 @@ void *http_handler(void *args)
 					 "Content-Length: %lu\r\n\r\n%s";
 
 			sprintf(response, format, strlen(user_agent), user_agent);
-			printf("response data : \n%s", response);
+			printf("\nresponse data : \n%s", response);
 		}
 	}
 	else if (strncmp(path, "/files/", 7) == 0)

@@ -1,0 +1,4 @@
+.git
+build
+vcpkg_installed
+*.md
